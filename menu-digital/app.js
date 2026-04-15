@@ -57,6 +57,7 @@ function saveOrders(orders) {
 // MAIN APP (halaman pelanggan)
 // ============================================================
 
+// ── Firebase Init (SATU config, SATU project) ──
 const firebaseConfig = {
   apiKey: "AIzaSyDn-9tGJRo8orusYbIxAGQWTzRP6gph1h0",
   authDomain: "rm-pondokmarisa.firebaseapp.com",
@@ -67,10 +68,53 @@ const firebaseConfig = {
   measurementId: "G-89V7JTGX83"
 };
 
-if (typeof firebase !== 'undefined' && !firebase.apps.length) {
-    firebase.initializeApp(firebaseConfig);
+let db = null;
+try {
+    if (typeof firebase !== 'undefined') {
+        if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+        db = firebase.firestore();
+        // Set timeout untuk operasi Firestore supaya tidak hang selamanya
+        db.settings({ experimentalForceLongPolling: false });
+    }
+} catch(e) {
+    console.error('[Firebase] Gagal inisialisasi:', e);
+    db = null;
 }
-const db = typeof firebase !== 'undefined' ? firebase.firestore() : null;
+
+// ── Helper: Bungkus Promise dengan timeout ──
+function withTimeout(promise, ms = 10000) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), ms))
+    ]);
+}
+
+// ── Helper: Tampilkan toast notifikasi ──
+function showToast(message, type = 'success') {
+    const existing = document.getElementById('rm-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'rm-toast';
+    const bg = type === 'error' ? '#e63946' : type === 'warning' ? '#f4a261' : '#2a9d8f';
+    toast.style.cssText = `
+        position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%);
+        background: ${bg}; color: #fff; padding: 12px 24px;
+        border-radius: 12px; font-size: 0.9rem; font-weight: 600;
+        z-index: 99999; box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        animation: rmToastIn 0.3s ease; white-space: nowrap;
+        max-width: 90vw; text-align: center;
+    `;
+    toast.textContent = message;
+    if (!document.getElementById('rm-toast-style')) {
+        const s = document.createElement('style');
+        s.id = 'rm-toast-style';
+        s.textContent = '@keyframes rmToastIn { from { opacity:0; bottom:70px } to { opacity:1; bottom:90px } }';
+        document.head.appendChild(s);
+    }
+    document.body.appendChild(toast);
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 3500);
+}
 
 document.addEventListener("DOMContentLoaded", async () => {
 
@@ -337,87 +381,112 @@ document.addEventListener("DOMContentLoaded", async () => {
         document.getElementById("summary-total").textContent       = formatRp(totalPrice());
     }
 
-    // ── Submit Pesanan ──
+    // ── Submit Pesanan (bulletproof version) ──
     window.submitOrder = async () => {
-        if (cart.length === 0) { alert("Keranjang masih kosong!"); return; }
+        if (cart.length === 0) { showToast('⚠️ Keranjang masih kosong!', 'warning'); return; }
 
         const name  = document.getElementById("order-name").value.trim();
         const table = document.getElementById("order-table").value.trim();
         const note  = document.getElementById("order-note").value.trim();
 
-        if (!name)  { alert("Mohon isi nama Anda!"); document.getElementById("order-name").focus(); return; }
-        if (!table) { alert("Mohon isi nomor meja!"); document.getElementById("order-table").focus(); return; }
+        if (!name)  { showToast('⚠️ Mohon isi nama Anda!', 'warning'); document.getElementById("order-name").focus(); return; }
+        if (!table) { showToast('⚠️ Mohon isi nomor meja!', 'warning'); document.getElementById("order-table").focus(); return; }
 
         const btn = document.getElementById("btn-submit-order");
-        btn.disabled = true; btn.textContent = "Mengirim...";
+        btn.disabled = true;
+        btn.textContent = "⏳ Mengirim...";
 
         const dt = Date.now();
         const orderId = "ORD-" + dt.toString().slice(-6);
-        
-        let draftList = [];
+
         try {
-            if (db) {
-                const draftSnap = await db.collection('PondokMarisaPOS').doc('draft_transaksi').get();
-                if (draftSnap.exists) draftList = draftSnap.data().data || [];
-            } else {
-                if (window.electronAPI) {
+            // ── 1. Baca draftList yang ada ──
+            let draftList = [];
+            try {
+                if (db) {
+                    const draftSnap = await withTimeout(db.collection('PondokMarisaPOS').doc('draft_transaksi').get(), 8000);
+                    if (draftSnap.exists) draftList = draftSnap.data().data || [];
+                } else if (window.electronAPI) {
                     draftList = await window.electronAPI.readData('draft_transaksi.json') || [];
                 } else {
-                    draftList = JSON.parse(localStorage.getItem('draft_transaksi') || "[]");
+                    draftList = JSON.parse(localStorage.getItem('draft_transaksi') || '[]');
                 }
+            } catch(readErr) {
+                console.warn('[RM] Baca draft gagal, mulai dari list kosong:', readErr.message);
+                // Pakai localStorage sebagai fallback baca
+                try { draftList = JSON.parse(localStorage.getItem('draft_transaksi') || '[]'); } catch(_) {}
             }
-        } catch(e) {}
 
-        const tagStr = `${name} (${table})`;
-        
-        const newDraft = { 
-            id: dt, 
-            tag: tagStr, 
-            time: new Date().toISOString(),
-            source: 'digital_menu',
-            isNewOrder: true, // For kasir notification badge
-            note: note,
-            items: cart.map(c => ({
-                id:       c.item.id,
-                nama:     c.item.name,
-                harga:    c.item.price,
-                qty:      c.qty,
-                varian:   c.varian || null,
-                catatan:  note || "",
-                category: c.item.category,
-                image:    c.item.image
-            }))
-        };
-        
-        draftList.push(newDraft);
+            // ── 2. Buat objek pesanan baru ──
+            const tagStr = `${name} (${table})`;
+            const newDraft = {
+                id: dt,
+                tag: tagStr,
+                time: new Date().toISOString(),
+                source: 'digital_menu',
+                isNewOrder: true,
+                note: note,
+                items: cart.map(c => ({
+                    id:       c.item.id,
+                    nama:     c.item.name,
+                    harga:    c.item.price,
+                    qty:      c.qty,
+                    varian:   c.varian || null,
+                    catatan:  note || '',
+                    category: c.item.category,
+                    image:    c.item.image
+                }))
+            };
+            draftList.push(newDraft);
 
-        try {
+            // ── 3. Simpan ke Firebase atau fallback ──
+            let savedToFirebase = false;
             if (db) {
-                await db.collection('PondokMarisaPOS').doc('draft_transaksi').set({
-                    data: draftList,
-                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                });
-            } else {
-                if (window.electronAPI) {
-                    await window.electronAPI.writeData('draft_transaksi.json', draftList);
-                } else {
+                try {
+                    await withTimeout(
+                        db.collection('PondokMarisaPOS').doc('draft_transaksi').set({
+                            data: draftList,
+                            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                        }),
+                        10000
+                    );
+                    savedToFirebase = true;
+                } catch(fbErr) {
+                    console.error('[RM] Firebase write gagal:', fbErr.message);
+                    // Fallback ke localStorage
                     localStorage.setItem('draft_transaksi', JSON.stringify(draftList));
+                    showToast('⚠️ Koneksi lambat, pesanan disimpan lokal. Kasir akan segera menerima.', 'warning');
                 }
+            } else if (window.electronAPI) {
+                await window.electronAPI.writeData('draft_transaksi.json', draftList);
+                savedToFirebase = true;
+            } else {
+                localStorage.setItem('draft_transaksi', JSON.stringify(draftList));
+                savedToFirebase = true;
             }
-        } catch(e) {}
 
-        // Reset
-        closeCart();
-        cart = [];
-        renderItems(); updateCartFAB();
-        ["order-name","order-table","order-note"].forEach(id => document.getElementById(id).value = '');
-        btn.disabled = false; btn.textContent = "🚀 Kirim Pesanan Sekarang";
+            // ── 4. Reset form & tampilkan sukses ──
+            closeCart();
+            cart = [];
+            renderItems(); updateCartFAB();
+            ['order-name','order-table','order-note'].forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
 
-        // Tampilkan halaman sukses
-        document.getElementById("success-name").textContent     = name;
-        document.getElementById("success-table").textContent    = table;
-        document.getElementById("success-order-id").textContent = orderId;
-        document.getElementById("order-success").classList.add("show");
+            document.getElementById('success-name').textContent     = name;
+            document.getElementById('success-table').textContent    = table;
+            document.getElementById('success-order-id').textContent = orderId;
+            document.getElementById('order-success').classList.add('show');
+
+            if (savedToFirebase) showToast('✅ Pesanan berhasil dikirim ke kasir!', 'success');
+
+        } catch(fatalErr) {
+            // Jika ada error yang benar-benar tidak terduga
+            console.error('[RM] Fatal error saat kirim pesanan:', fatalErr);
+            showToast('❌ Gagal mengirim pesanan. Coba lagi.', 'error');
+        } finally {
+            // Tombol SELALU dikembalikan, tidak peduli apapun yang terjadi
+            btn.disabled = false;
+            btn.textContent = '🚀 Kirim Pesanan Sekarang';
+        }
     };
 
     window.backToMenu = () => document.getElementById("order-success").classList.remove("show");
